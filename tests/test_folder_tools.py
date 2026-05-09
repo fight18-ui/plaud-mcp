@@ -1,12 +1,13 @@
 """Unit tests for plaud-mcp folder tools (cmd_875 wave2)."""
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
-from unittest.mock import AsyncMock, patch
 
 from plaud_mcp.server import (
-    list_folders,
     create_folder,
+    list_folders,
     move_file_to_folder,
     unset_file_folder,
 )
@@ -15,8 +16,8 @@ from plaud_mcp.server import (
 @pytest.fixture
 def mock_client():
     """Return a mock PlaudClient context manager."""
-    with patch("plaud_mcp.server.PlaudClient") as MockClient:
-        instance = MockClient.return_value.__aenter__.return_value
+    with patch("plaud_mcp.server.PlaudClient") as mock_client_cls:
+        instance = mock_client_cls.return_value.__aenter__.return_value
         yield instance
 
 
