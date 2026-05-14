@@ -1,7 +1,7 @@
 """
 Plaud MCP Server — FastMCP application exposing Plaud cloud API data as tools.
 
-Provides 8 tools:
+Provides 14 tools:
   TOOL-01: check_connection     — verify token, return file count
   TOOL-02: get_file_count       — return total recordings count
   TOOL-03: get_recent_files     — list files from last N days
@@ -10,12 +10,20 @@ Provides 8 tools:
   TOOL-06: get_transcript       — fetch transcript via signed S3 URL
   TOOL-07: get_summary          — fetch AI summary via signed S3 URL
   TOOL-08: search_transcripts   — client-side transcript search
+  TOOL-09: list_folders         — list Plaud filetag folders
+  TOOL-10: create_folder        — create a Plaud filetag folder
+  TOOL-11: move_file_to_folder  — move a recording into one folder
+  TOOL-12: unset_file_folder    — remove a recording from all folders
+  TOOL-13: start_transcription  — trigger or dry-run transcription generation
+  TOOL-14: get_task_status      — return Plaud transcription task status
 
 Security:
   T-02-01: file_id validated non-empty before URL construction.
   T-02-02: S3 URLs only sourced from content_list[].data_link (Plaud API response).
   T-02-04: search_transcripts bounded to 50 files.
+  T-02-05: start_transcription defaults to dry_run=True and never posts in dry-run mode.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -36,6 +44,7 @@ mcp = FastMCP("plaud")
 async def health_check(request):
     """Health check endpoint for Kubernetes liveness probe (HTTP mode only)."""
     from starlette.responses import JSONResponse
+
     return JSONResponse({"status": "ok"})
 
 
@@ -153,15 +162,12 @@ async def get_files(
                 break
     if start_date is not None:
         start_ts = (
-            datetime.strptime(start_date, "%Y-%m-%d")
-            .replace(tzinfo=timezone.utc)
-            .timestamp()
+            datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
         ) * 1000  # start_time is in milliseconds
         files = [f for f in files if f.get("start_time", 0) >= start_ts]
     if end_date is not None:
         end_ts = (
-            datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            + timedelta(days=1)
+            datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
         ).timestamp() * 1000  # start_time is in milliseconds
         files = [f for f in files if f.get("start_time", 0) < end_ts]
     return {"files": files, "count": len(files)}
@@ -233,11 +239,7 @@ async def get_transcript(file_id: str) -> dict:
         raise ValueError(f"No transcript found for file_id={file_id}")
     transcript_data = await asyncio.to_thread(_fetch_s3_content, content_item["data_link"])
     items = transcript_data.get("list", []) if isinstance(transcript_data, dict) else transcript_data
-    speakers = {
-        item.get("speaker")
-        for item in items
-        if item.get("speaker")
-    }
+    speakers = {item.get("speaker") for item in items if item.get("speaker")}
     return {
         "file_id": file_id,
         "transcript": transcript_data,
@@ -271,6 +273,80 @@ async def get_summary(file_id: str) -> dict:
         raise ValueError(f"No summary found for file_id={file_id}")
     summary_data = await asyncio.to_thread(_fetch_s3_content, content_item["data_link"])
     return {"file_id": file_id, "summary": summary_data}
+
+
+def _transcription_body(is_reload: int) -> dict[str, Any]:
+    """Return the Plaud transcription generation request body."""
+    return {
+        "is_reload": is_reload,
+        "summ_type": "AUTO-SELECT",
+        "summ_type_type": "system",
+        "info": '{"language":"auto","timezone":9,"diarization":1,"llm":"auto"}',
+        "support_mul_summ": True,
+    }
+
+
+@mcp.tool()
+async def start_transcription(
+    file_id: str,
+    is_reload: int = 0,
+    dry_run: bool = True,
+) -> dict:
+    """Start transcription/summary generation for a Plaud recording.
+
+    Args:
+        file_id: The Plaud file identifier (non-empty string).
+        is_reload: Plaud reload flag. Defaults to 0.
+        dry_run: If True (default), return the planned request without posting.
+
+    Returns a dict describing the planned request in dry-run mode, or the Plaud
+    API response in live mode.
+    """
+    trimmed = file_id.strip() if file_id else ""
+    if not trimmed:
+        return {
+            "ok": False,
+            "dry_run": dry_run,
+            "message": "file_id must be a non-empty string",
+            "errors": "empty file_id",
+        }
+
+    endpoint = f"/ai/transsumm/{trimmed}"
+    body = _transcription_body(is_reload=is_reload)
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "file_id": trimmed,
+            "method": "POST",
+            "endpoint": endpoint,
+            "body": body,
+            "message": f"Planned: start transcription for file {trimmed}",
+        }
+
+    async with PlaudClient() as client:
+        resp = await client.post(endpoint, json=body)
+    return {
+        "ok": True,
+        "dry_run": False,
+        "file_id": trimmed,
+        "method": "POST",
+        "endpoint": endpoint,
+        "body": body,
+        "response": resp,
+        "message": f"Started transcription for file {trimmed}",
+    }
+
+
+@mcp.tool()
+async def get_task_status() -> dict:
+    """Return Plaud transcription generation task status.
+
+    Returns the Plaud API response for all active file tasks.
+    """
+    async with PlaudClient() as client:
+        return await client.get("/ai/file-task-status")
 
 
 @mcp.tool()
@@ -313,25 +389,17 @@ async def search_transcripts(query: str, days: int = 30) -> dict:
                 detail_resp = await client.get(f"/file/detail/{f['id']}")
                 detail = detail_resp.get("data", {})
                 content_item = next(
-                    (
-                        c
-                        for c in detail.get("content_list", [])
-                        if c.get("data_type") == "transaction"
-                    ),
+                    (c for c in detail.get("content_list", []) if c.get("data_type") == "transaction"),
                     None,
                 )
                 if content_item is None:
                     continue
-                transcript_data = await asyncio.to_thread(
-                    _fetch_s3_content, content_item["data_link"]
-                )
+                transcript_data = await asyncio.to_thread(_fetch_s3_content, content_item["data_link"])
             except Exception:
                 continue  # skip files with missing or erroring transcripts
 
             items = transcript_data.get("list", []) if isinstance(transcript_data, dict) else transcript_data
-            full_text = " ".join(
-                item.get("text", "") or item.get("content", "") for item in items
-            )
+            full_text = " ".join(item.get("text", "") or item.get("content", "") for item in items)
             if query.lower() in full_text.lower():
                 idx = full_text.lower().index(query.lower())
                 snippet = full_text[max(0, idx - 50) : idx + len(query) + 150].strip()
